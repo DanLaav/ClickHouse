@@ -169,6 +169,10 @@ WHERE t_str.x = t_str2.x AND t_str2.x = t_str3.x
 ORDER BY t_str.x
 SETTINGS enable_join_transitive_predicates = 0;
 
+-- 13b plan: bias sizes so optimizer pairs t_str+t_str3 first, forcing synthesized predicate.
+-- Need |t_str3| < |t_str| < |t_str2| so cost(t_str, t_str3) is strictly minimal.
+INSERT INTO t_str  SELECT toString(number % 5) FROM numbers(100);
+INSERT INTO t_str2 SELECT toString(number % 5) FROM numbers(10000);
 SELECT '-- Case 13b: plan';
 SELECT explain FROM (
     EXPLAIN actions = 1
@@ -213,6 +217,10 @@ SELECT n1.x, n2.x, n3.x FROM n1, n2, n3
 WHERE n1.x = n2.x AND n2.x = n3.x ORDER BY n1.x
 SETTINGS enable_join_transitive_predicates = 0;
 
+-- 14a plan: bias sizes so optimizer pairs n1+n3 first, forcing synthesized predicate.
+-- Need |n3| < |n1| < |n2| so cost(n1, n3) is strictly minimal.
+INSERT INTO n1 SELECT number % 6 FROM numbers(100);
+INSERT INTO n2 SELECT number % 6 FROM numbers(10000);
 SELECT '-- Case 14a: plan';
 SELECT explain FROM (
     EXPLAIN actions = 1
@@ -261,6 +269,10 @@ SELECT lc1.x, lc2.x, lc3.x FROM lc1, lc2, lc3
 WHERE lc1.x = lc2.x AND lc2.x = lc3.x ORDER BY lc1.x
 SETTINGS enable_join_transitive_predicates = 0;
 
+-- 14c plan: bias sizes so optimizer pairs lc1+lc3 first, forcing synthesized predicate.
+-- Need |lc3| < |lc1| < |lc2| so cost(lc1, lc3) is strictly minimal.
+INSERT INTO lc1 SELECT toString(number % 5) FROM numbers(100);
+INSERT INTO lc2 SELECT toString(number % 5) FROM numbers(10000);
 SELECT '-- Case 14c: plan';
 SELECT explain FROM (
     EXPLAIN actions = 1
