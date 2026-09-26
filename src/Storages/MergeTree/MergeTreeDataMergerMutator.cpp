@@ -1,9 +1,13 @@
+#include <cstddef>
 #include <Storages/MergeTree/Compaction/CompactionStatistics.h>
 #include <Storages/MergeTree/MergeTreeDataMergerMutator.h>
 #include <Storages/MergeTree/MergeTreeSettings.h>
 
 #include <Common/ElapsedTimeProfileEventIncrement.h>
 #include <Common/quoteString.h>
+#include <Common/WeightedRandomSampling.h>
+#include <Common/formatReadable.h>
+
 #include <Interpreters/Context.h>
 
 #include <base/insertAtEnd.h>
@@ -42,6 +46,8 @@ namespace MergeTreeSetting
     extern const MergeTreeSettingsBool enable_max_bytes_limit_for_min_age_to_force_merge;
     extern const MergeTreeSettingsUInt64 number_of_free_entries_in_pool_to_execute_optimize_entire_partition;
     extern const MergeTreeSettingsBool apply_patches_on_merge;
+    extern const MergeTreeSettingsUInt64 replacing_merge_cleanup_period_seconds;
+    extern const MergeTreeSettingsBool allow_experimental_replacing_merge_with_cleanup;
 }
 
 namespace
@@ -126,20 +132,6 @@ PartsRanges splitByMergePredicate(PartsRanges && ranges, const MergePredicatePtr
     return checkRanges(std::move(mergeable_ranges));
 }
 
-std::expected<void, PreformattedMessage> canMergeAllParts(const PartsRange & range, const MergePredicatePtr & merge_predicate)
-{
-    for (size_t i = 1; i < range.size(); ++i)
-    {
-        const auto & prev_part = range[i - 1];
-        const auto & current_part = range[i];
-
-        if (auto can_merge_result = merge_predicate->canMergeParts(prev_part, current_part); !can_merge_result)
-            return can_merge_result;
-    }
-
-    return {};
-}
-
 std::unordered_map<String, PartsRanges> combineByPartitions(PartsRanges && ranges)
 {
     std::unordered_map<String, PartsRanges> ranges_by_partitions;
@@ -153,68 +145,64 @@ std::unordered_map<String, PartsRanges> combineByPartitions(PartsRanges && range
     return ranges_by_partitions;
 }
 
-String getBestPartitionToOptimizeEntire(
-    size_t max_total_size_to_merge,
-    const ContextPtr & context,
-    const MergeTreeSettingsPtr & settings,
+} // anonymous namespace
+
+String MergeTreeDataMergerMutator::getBestPartitionForPeriodicCleanup(
     const PartitionsStatistics & stats,
-    const LoggerPtr & log)
+    time_t current_time) const
 {
-    if (!(*settings)[MergeTreeSetting::min_age_to_force_merge_on_partition_only])
+    const auto settings = data.getSettings();
+
+    if (!(*settings)[MergeTreeSetting::replacing_merge_cleanup_period_seconds])
         return {};
 
-    if (!(*settings)[MergeTreeSetting::min_age_to_force_merge_seconds])
+    /// Cleanup merges are only meaningful for ReplacingMergeTree with is_deleted support.
+    /// Skip if the prerequisite experimental flag is not enabled or the table has no is_deleted column.
+    if (!(*settings)[MergeTreeSetting::allow_experimental_replacing_merge_with_cleanup]
+        || data.merging_params.is_deleted_column.empty())
         return {};
 
     Int64 occupied = CurrentMetrics::values[CurrentMetrics::BackgroundMergesAndMutationsPoolTask].load(std::memory_order_relaxed);
-    Int64 max_tasks_count = context->getMergeMutateExecutor()->getMaxTasksCount();
+    Int64 max_tasks_count = data.getContext()->getMergeMutateExecutor()->getMaxTasksCount();
     Int64 optimize_entire_partition_threshold = (*settings)[MergeTreeSetting::number_of_free_entries_in_pool_to_execute_optimize_entire_partition];
     if (occupied > 1 && max_tasks_count - occupied < optimize_entire_partition_threshold)
     {
         LOG_INFO(log,
-            "Not enough idle threads to execute optimizing entire partition. See settings "
+            "Not enough idle threads to execute periodic cleanup merge. See settings "
             "'number_of_free_entries_in_pool_to_execute_optimize_entire_partition' and 'background_pool_size'");
-
         return {};
     }
 
-    const auto is_partition_invalid = [&](const PartitionStatistics & partition)
+    String best_partition;
+    time_t best_next_time = std::numeric_limits<time_t>::max();
+
+    for (const auto & [partition_id, partition_stats] : stats)
     {
-        if (partition.part_count == 1)
-            return true;
+        /// Skip empty partitions — nothing to clean up
+        if (partition_stats.part_count == 0)
+            continue;
 
-        if (!max_total_size_to_merge || !(*settings)[MergeTreeSetting::enable_max_bytes_limit_for_min_age_to_force_merge])
-            return false;
+        auto it = next_cleanup_merge_time_by_partition.find(partition_id);
+        const time_t next_time = (it != next_cleanup_merge_time_by_partition.end()) ? it->second : 0;
 
-        return partition.total_size > max_total_size_to_merge;
-    };
+        if (current_time < next_time)
+            continue;
 
-    auto best_partition_it = std::max_element(
-        stats.begin(),
-        stats.end(),
-        [&](const auto & e1, const auto & e2)
+        /// Among all ready partitions, pick the one whose cleanup is most overdue
+        if (next_time < best_next_time)
         {
-            // If one partition cannot be used for some reason (e.g. it has only single part, or it's size greater than limit), always select the other partition.
-            if (is_partition_invalid(e1.second))
-                return true;
+            best_next_time = next_time;
+            best_partition = partition_id;
+        }
+    }
 
-            if (is_partition_invalid(e2.second))
-                return false;
-
-            // If both partitions have more than one part, select the older partition.
-            return e1.second.min_age < e2.second.min_age;
-        });
-
-    chassert(best_partition_it != stats.end());
-
-    const size_t best_partition_min_age = static_cast<size_t>(best_partition_it->second.min_age);
-    if (best_partition_min_age < (*settings)[MergeTreeSetting::min_age_to_force_merge_seconds] || is_partition_invalid(best_partition_it->second))
-        return {};
-
-    return best_partition_it->first;
+    return best_partition;
 }
 
-CollectedPartsRanges grabAllPossibleRanges(
+namespace
+{
+
+CollectedPartsRanges collectAllPossibleRanges(
     const PartsCollectorPtr & parts_collector,
     const StorageMetadataPtr & metadata_snapshot,
     const StoragePolicyPtr & storage_policy,
@@ -224,54 +212,6 @@ CollectedPartsRanges grabAllPossibleRanges(
 {
     ProfileEventTimeIncrement<Microseconds> watch(ProfileEvents::MergerMutatorsGetPartsForMergeElapsedMicroseconds);
     return parts_collector->grabAllPossibleRanges(metadata_snapshot, storage_policy, current_time, partitions_hint, series_log);
-}
-
-std::expected<PartsRange, PreformattedMessage> grabAllPartsInsidePartition(
-    const PartsCollectorPtr & parts_collector,
-    const StorageMetadataPtr & metadata_snapshot,
-    const StoragePolicyPtr & storage_policy,
-    const time_t & current_time,
-    const std::string & partition_id)
-{
-    ProfileEventTimeIncrement<Microseconds> watch(ProfileEvents::MergerMutatorsGetPartsForMergeElapsedMicroseconds);
-    return parts_collector->grabAllPartsInsidePartition(metadata_snapshot, storage_policy, current_time, partition_id);
-}
-
-MergeSelectorChoices chooseMergesFrom(
-    const MergeSelectorApplier & selector,
-    const IMergePredicate & predicate,
-    const PartsRanges & ranges,
-    const PartitionsStatistics & partitions_stats,
-    const StorageMetadataPtr & metadata_snapshot,
-    const MergeTreeSettingsPtr & data_settings,
-    const PartitionIdToTTLs & next_delete_times,
-    const PartitionIdToTTLs & next_recompress_times,
-    bool can_use_ttl_merges,
-    time_t current_time,
-    const LoggerPtr & log)
-{
-    ProfileEventTimeIncrement<Microseconds> watch(ProfileEvents::MergerMutatorSelectPartsForMergeElapsedMicroseconds);
-
-    auto choices = selector.chooseMergesFrom(
-        ranges, partitions_stats, predicate, metadata_snapshot,
-        data_settings, next_delete_times, next_recompress_times,
-        can_use_ttl_merges, current_time);
-
-    if (!choices.empty())
-    {
-        LOG_TRACE(log, "Selected {} merge ranges. Merge selecting phase took: {}ms", choices.size(), watch.elapsed() / 1000);
-
-        for (size_t i = 0; i < choices.size(); ++i)
-        {
-            const auto & merge_type = choices[i].merge_type;
-            const auto & range = choices[i].range;
-            const auto & range_patches = choices[i].range_patches;
-            ProfileEvents::increment(ProfileEvents::MergerMutatorSelectRangePartsCount, range.size());
-            LOG_TRACE(log, "Merge #{} type {} with {} parts from {} to {} with {} patches", i, merge_type, range.size(), range.front().name, range.back().name, range_patches.size());
-        }
-    }
-
-    return choices;
 }
 
 }
@@ -339,13 +279,13 @@ PartitionIdsHint MergeTreeDataMergerMutator::getPartitionsThatMayBeMerged(
 {
     const auto context = data.getContext();
     const auto settings = data.getSettings();
-    const auto metadata_snapshot = data.getInMemoryMetadataPtr();
+    const auto metadata_snapshot = data.getInMemoryMetadataPtr(context, false);
     const auto storage_policy = data.getStoragePolicy();
     const time_t current_time = std::time(nullptr);
     const bool can_use_ttl_merges = !ttl_merges_blocker.isCancelled();
     LogSeriesLimiter series_log(log, 1, /*interval_s_=*/60 * 30);
 
-    auto collected = grabAllPossibleRanges(parts_collector, metadata_snapshot, storage_policy, current_time, std::nullopt, series_log);
+    auto collected = collectAllPossibleRanges(parts_collector, metadata_snapshot, storage_policy, current_time, std::nullopt, series_log);
     if (collected.ranges.empty())
         return {};
 
@@ -373,11 +313,14 @@ PartitionIdsHint MergeTreeDataMergerMutator::getPartitionsThatMayBeMerged(
         if (!merge_choices.empty())
             partitions_hint.insert(partition_id);
         else
-            LOG_TEST(log, "Nothing to merge in partition {} with max_merge_sizes = {} (looked up {} ranges)",
+            LOG_TEST(log, "Nothing to merge in partition {} with merge_constraints = {} (looked up {} ranges)",
                 partition_id, convertMergeConstraintsToString(selector.merge_constraints), ranges_in_partition.size());
     }
 
     if (auto best = getBestPartitionToOptimizeEntire(selector.merge_constraints[0].max_size_bytes, context, settings, partitions_stats, log); !best.empty())
+        partitions_hint.insert(std::move(best));
+
+    if (auto best = getBestPartitionForPeriodicCleanup(partitions_stats, current_time); !best.empty())
         partitions_hint.insert(std::move(best));
 
     LOG_TRACE(log,
@@ -397,13 +340,13 @@ std::expected<MergeSelectorChoices, SelectMergeFailure> MergeTreeDataMergerMutat
 {
     const auto context = data.getContext();
     const auto settings = data.getSettings();
-    const auto metadata_snapshot = data.getInMemoryMetadataPtr();
+    const auto metadata_snapshot = data.getInMemoryMetadataPtr(context, false);
     const auto storage_policy = data.getStoragePolicy();
     const time_t current_time = std::time(nullptr);
     const bool can_use_ttl_merges = !ttl_merges_blocker.isCancelled();
     LogSeriesLimiter series_log(log, 1, /*interval_s_=*/60 * 30);
 
-    auto collected = grabAllPossibleRanges(parts_collector, metadata_snapshot, storage_policy, current_time, partitions_hint, series_log);
+    auto collected = collectAllPossibleRanges(parts_collector, metadata_snapshot, storage_policy, current_time, partitions_hint, series_log);
     if (collected.ranges.empty())
     {
         return std::unexpected(SelectMergeFailure{
@@ -443,6 +386,39 @@ std::expected<MergeSelectorChoices, SelectMergeFailure> MergeTreeDataMergerMutat
             /*partition_id=*/best,
             /*final=*/true,
             /*optimize_skip_merged_partitions=*/true);
+    }
+
+    if (auto best = getBestPartitionForPeriodicCleanup(partitions_stats, current_time); !best.empty())
+    {
+        auto result = selectAllPartsToMergeWithinPartition(
+            metadata_snapshot,
+            parts_collector,
+            merge_predicate,
+            /*partition_id=*/best,
+            /*final=*/true,
+            /*optimize_skip_merged_partitions=*/false);
+
+        /// Always advance the cooldown timer, whether selection succeeded or not.
+        /// Without this, a partition that fails selection (e.g. because the merge predicate
+        /// blocks it) would be picked again on every scheduler cycle with no backoff,
+        /// causing repeated failed attempts and noisy logs.
+        next_cleanup_merge_time_by_partition[best] = current_time + (*settings)[MergeTreeSetting::replacing_merge_cleanup_period_seconds];
+
+        if (result.has_value())
+        {
+            chassert(!result->empty());
+            result->front().is_periodic_cleanup = true;
+
+            const auto & storage = data.getStorageID();
+            LOG_DEBUG(log, "Scheduled periodic cleanup merge for table {}.{}, partition '{}'. "
+                           "Next cleanup for this partition allowed after: {}.",
+                           backQuote(storage.database_name),
+                           backQuote(storage.table_name),
+                           best,
+                           toString(next_cleanup_merge_time_by_partition[best]));
+        }
+
+        return result;
     }
 
     return std::unexpected(SelectMergeFailure{
@@ -565,7 +541,6 @@ MergeTaskPtr MergeTreeDataMergerMutator::mergePartsToTemporaryPart(
     bool cleanup,
     MergeTreeData::MergingParams merging_params,
     MergeTreeTransactionPtr txn,
-    bool need_prefix,
     ProjectionDescriptionRawPtr projection,
     IMergeTreeDataPart * parent_part,
     const String & suffix)
@@ -589,7 +564,6 @@ MergeTaskPtr MergeTreeDataMergerMutator::mergePartsToTemporaryPart(
         deduplicate_by_columns,
         cleanup,
         std::move(merging_params),
-        need_prefix,
         projection,
         parent_part,
         nullptr,
@@ -607,12 +581,28 @@ MutateTaskPtr MergeTreeDataMergerMutator::mutatePartToTemporaryPart(
     MutationCommandsConstPtr commands,
     MergeListEntry * merge_entry,
     time_t time_of_mutation,
-    ContextPtr context,
+    ContextMutablePtr context,
     const MergeTreeTransactionPtr & txn,
     ReservationSharedPtr space_reservation,
-    TableLockHolder & holder,
-    bool need_prefix)
+    TableLockHolder & holder)
 {
+    /// Building the mutation pipeline can run nested blocking pipelines via `CompletedPipelineExecutor` -
+    /// most notably `KeyCondition::buildOrderedSetInplace` materializing the right side of `x IN (subquery)`
+    /// to use it for primary-key / skip-index analysis. Such a build observes cancellation only through the
+    /// query context's interactive-cancel callback, so without one it blocks server shutdown and
+    /// `KILL MUTATION` until the subquery finishes (issue #51586). `context` is this mutation's query context
+    /// (`makeQueryContextForMutate`), which the reading context resolves via `getQueryContext`.
+    /// A nested pipeline that is only stopped returns without an exception, so its caller cannot
+    /// distinguish a cancelled build from a completed one.
+    const String partition_id = future_part->part_info.getPartitionId();
+    context->setInteractiveCancelCallback(
+        [&blocker = merges_blocker, merge_entry, partition_id]()
+        {
+            if (blocker.isCancelledForPartition(partition_id) || (*merge_entry)->is_cancelled)
+                throw Exception(ErrorCodes::ABORTED, "Cancelled mutating parts");
+            return false;
+        });
+
     return std::make_shared<MutateTask>(
         future_part,
         metadata_snapshot,
@@ -625,8 +615,7 @@ MutateTaskPtr MergeTreeDataMergerMutator::mutatePartToTemporaryPart(
         txn,
         data,
         *this,
-        merges_blocker,
-        need_prefix);
+        merges_blocker);
 }
 
 MergeTreeData::DataPartPtr MergeTreeDataMergerMutator::renameMergedTemporaryPart(
@@ -638,7 +627,7 @@ MergeTreeData::DataPartPtr MergeTreeDataMergerMutator::renameMergedTemporaryPart
     /// Some of source parts was possibly created in transaction, so non-transactional merge may break isolation.
     if (data.transactions_enabled.load(std::memory_order_relaxed) && !txn)
         throw Exception(ErrorCodes::ABORTED,
-            "Cancelling merge, because it was done without starting transaction,"
+            "Cancelling merge, because it was done without starting transaction, "
             "but transactions were enabled for this table");
 
     /// Rename new part, add to the set and remove original parts.
@@ -696,6 +685,156 @@ MergeTreeData::DataPartPtr MergeTreeDataMergerMutator::renameMergedTemporaryPart
 
     LOG_TRACE(log, "Merged {} parts: [{}, {}] -> {}", parts.size(), parts.front()->name, parts.back()->name, new_data_part->name);
     return new_data_part;
+}
+
+std::expected<void, PreformattedMessage> canMergeAllParts(const PartsRange & range, const MergePredicatePtr & merge_predicate)
+{
+    for (size_t i = 1; i < range.size(); ++i)
+    {
+        const auto & prev_part = range[i - 1];
+        const auto & current_part = range[i];
+
+        if (auto can_merge_result = merge_predicate->canMergeParts(prev_part, current_part); !can_merge_result)
+            return can_merge_result;
+    }
+
+    return {};
+}
+
+std::unordered_map<String, PartitionStatistics> calculateStatisticsForPartitions(const PartsRanges & ranges)
+{
+    std::unordered_map<String, PartitionStatistics> stats;
+
+    for (const auto & range : ranges)
+    {
+        chassert(!range.empty());
+        PartitionStatistics & partition_stats = stats[range.front().info.getPartitionId()];
+
+        partition_stats.part_count += range.size();
+
+        for (const auto & part : range)
+        {
+            partition_stats.min_age = std::min(partition_stats.min_age, part.age);
+            partition_stats.total_size += part.size;
+        }
+    }
+
+    return stats;
+}
+
+String getBestPartitionToOptimizeEntire(
+    size_t max_total_size_to_merge,
+    const ContextPtr & context,
+    const MergeTreeSettingsPtr & settings,
+    const std::unordered_map<String, PartitionStatistics> & stats,
+    const LoggerPtr & log)
+{
+    if (!(*settings)[MergeTreeSetting::min_age_to_force_merge_on_partition_only])
+        return {};
+
+    if (!(*settings)[MergeTreeSetting::min_age_to_force_merge_seconds])
+        return {};
+
+    size_t occupied = CurrentMetrics::values[CurrentMetrics::BackgroundMergesAndMutationsPoolTask].load(std::memory_order_relaxed);
+    size_t max_tasks_count = context->getMergeMutateExecutor()->getMaxTasksCount();
+    if (occupied > 1 && max_tasks_count - occupied < (*settings)[MergeTreeSetting::number_of_free_entries_in_pool_to_execute_optimize_entire_partition])
+    {
+        LOG_INFO(log,
+            "Not enough idle threads to execute optimizing entire partition. See settings "
+            "'number_of_free_entries_in_pool_to_execute_optimize_entire_partition' and 'background_pool_size'");
+        return {};
+    }
+
+    const auto is_partition_invalid = [&](const PartitionStatistics & partition)
+    {
+        if (partition.part_count == 1)
+            return true;
+
+        if (!max_total_size_to_merge || !(*settings)[MergeTreeSetting::enable_max_bytes_limit_for_min_age_to_force_merge])
+            return false;
+
+        return partition.total_size > max_total_size_to_merge;
+    };
+
+    auto best_partition_it = std::max_element(
+        stats.begin(),
+        stats.end(),
+        [&](const auto & e1, const auto & e2)
+        {
+            if (is_partition_invalid(e1.second))
+                return true;
+            if (is_partition_invalid(e2.second))
+                return false;
+            return e1.second.min_age < e2.second.min_age;
+        });
+
+    chassert(best_partition_it != stats.end());
+
+    const size_t best_partition_min_age = static_cast<size_t>(best_partition_it->second.min_age);
+    if (best_partition_min_age < (*settings)[MergeTreeSetting::min_age_to_force_merge_seconds] || is_partition_invalid(best_partition_it->second))
+        return {};
+
+    return best_partition_it->first;
+}
+
+PartsRanges grabAllPossibleRanges(
+    const PartsCollectorPtr & parts_collector,
+    const StorageMetadataPtr & metadata_snapshot,
+    const StoragePolicyPtr & storage_policy,
+    const time_t & current_time,
+    const std::optional<PartitionIdsHint> & partitions_hint,
+    LogSeriesLimiter & series_log)
+{
+    ProfileEventTimeIncrement<Microseconds> watch(ProfileEvents::MergerMutatorsGetPartsForMergeElapsedMicroseconds);
+    return parts_collector->grabAllPossibleRanges(metadata_snapshot, storage_policy, current_time, partitions_hint, series_log).ranges;
+}
+
+MergeSelectorChoices chooseMergesFrom(
+    const MergeSelectorApplier & selector,
+    const IMergePredicate & predicate,
+    const PartsRanges & ranges,
+    const PartitionsStatistics & partitions_stats,
+    const StorageMetadataPtr & metadata_snapshot,
+    const MergeTreeSettingsPtr & data_settings,
+    const PartitionIdToTTLs & next_delete_times,
+    const PartitionIdToTTLs & next_recompress_times,
+    bool can_use_ttl_merges,
+    time_t current_time,
+    const LoggerPtr & log)
+{
+    ProfileEventTimeIncrement<Microseconds> watch(ProfileEvents::MergerMutatorSelectPartsForMergeElapsedMicroseconds);
+
+    auto choices = selector.chooseMergesFrom(
+        ranges, partitions_stats, predicate, metadata_snapshot,
+        data_settings, next_delete_times, next_recompress_times,
+        can_use_ttl_merges, current_time);
+
+    if (!choices.empty())
+    {
+        LOG_TRACE(log, "Selected {} merge ranges. Merge selecting phase took: {}ms", choices.size(), watch.elapsed() / 1000);
+
+        for (size_t i = 0; i < choices.size(); ++i)
+        {
+            const auto & merge_type = choices[i].merge_type;
+            const auto & range = choices[i].range;
+            const auto & range_patches = choices[i].range_patches;
+            ProfileEvents::increment(ProfileEvents::MergerMutatorSelectRangePartsCount, range.size());
+            LOG_TRACE(log, "Merge #{} type {} with {} parts from {} to {} with {} patches", i, merge_type, range.size(), range.front().name, range.back().name, range_patches.size());
+        }
+    }
+
+    return choices;
+}
+
+std::expected<PartsRange, PreformattedMessage> grabAllPartsInsidePartition(
+    const PartsCollectorPtr & parts_collector,
+    const StorageMetadataPtr & metadata_snapshot,
+    const StoragePolicyPtr & storage_policy,
+    const time_t & current_time,
+    const std::string & partition_id)
+{
+    ProfileEventTimeIncrement<Microseconds> watch(ProfileEvents::MergerMutatorsGetPartsForMergeElapsedMicroseconds);
+    return parts_collector->grabAllPartsInsidePartition(metadata_snapshot, storage_policy, current_time, partition_id);
 }
 
 }

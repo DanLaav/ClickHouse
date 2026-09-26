@@ -91,7 +91,6 @@ public:
         bool cleanup,
         MergeTreeData::MergingParams merging_params,
         MergeTreeTransactionPtr txn,
-        bool need_prefix = true,
         ProjectionDescriptionRawPtr projection = nullptr,
         IMergeTreeDataPart * parent_part = nullptr,
         const String & suffix = "");
@@ -104,11 +103,10 @@ public:
         MutationCommandsConstPtr commands,
         MergeListEntry * merge_entry,
         time_t time_of_mutation,
-        ContextPtr context,
+        ContextMutablePtr context,
         const MergeTreeTransactionPtr & txn,
         ReservationSharedPtr space_reservation,
-        TableLockHolder & table_lock_holder,
-        bool need_prefix = true);
+        TableLockHolder & table_lock_holder);
 
     MergeTreeData::DataPartPtr renameMergedTemporaryPart(
         MergeTreeData::MutableDataPartPtr & new_data_part,
@@ -134,8 +132,58 @@ private:
     PartitionIdToTTLs next_recompress_ttl_merge_times_by_partition;
     /// Performing TTL merges independently for each partition guarantees that
     /// there is only a limited number of TTL merges and no partition stores data, that is too stale
+
+    /// Stores the next allowed periodic cleanup merge time for each partition.
+    /// Used when `replacing_merge_cleanup_period_seconds` is set on a ReplacingMergeTree with `is_deleted`.
+    PartitionIdToTTLs next_cleanup_merge_time_by_partition;
+
+    /// Returns the partition ID ready for a periodic cleanup merge, or an empty string if none qualifies.
+    /// A partition qualifies when `now >= next_cleanup_merge_time_by_partition[partition]`
+    /// and the partition is non-empty. Single-part partitions are included because a cleanup
+    /// rewrite is still needed to physically remove `is_deleted = 1` rows.
+    String getBestPartitionForPeriodicCleanup(
+        const PartitionsStatistics & stats,
+        time_t current_time) const;
 };
 
 std::string convertMergeConstraintsToString(const MergeConstraints & constraints);
+
+std::expected<void, PreformattedMessage> canMergeAllParts(const PartsRange & range, const MergePredicatePtr & merge_predicate);
+std::unordered_map<String, PartitionStatistics> calculateStatisticsForPartitions(const PartsRanges & ranges);
+
+String getBestPartitionToOptimizeEntire(
+    size_t max_total_size_to_merge,
+    const ContextPtr & context,
+    const MergeTreeSettingsPtr & settings,
+    const std::unordered_map<String, PartitionStatistics> & stats,
+    const LoggerPtr & log);
+
+PartsRanges grabAllPossibleRanges(
+    const PartsCollectorPtr & parts_collector,
+    const StorageMetadataPtr & metadata_snapshot,
+    const StoragePolicyPtr & storage_policy,
+    const time_t & current_time,
+    const std::optional<PartitionIdsHint> & partitions_hint,
+    LogSeriesLimiter & series_log);
+
+MergeSelectorChoices chooseMergesFrom(
+    const MergeSelectorApplier & selector,
+    const IMergePredicate & predicate,
+    const PartsRanges & ranges,
+    const PartitionsStatistics & partitions_stats,
+    const StorageMetadataPtr & metadata_snapshot,
+    const MergeTreeSettingsPtr & data_settings,
+    const PartitionIdToTTLs & next_delete_times,
+    const PartitionIdToTTLs & next_recompress_times,
+    bool can_use_ttl_merges,
+    time_t current_time,
+    const LoggerPtr & log);
+
+std::expected<PartsRange, PreformattedMessage> grabAllPartsInsidePartition(
+    const PartsCollectorPtr & parts_collector,
+    const StorageMetadataPtr & metadata_snapshot,
+    const StoragePolicyPtr & storage_policy,
+    const time_t & current_time,
+    const std::string & partition_id);
 
 }
